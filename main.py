@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import gspread
 from aiohttp import web
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -21,12 +22,14 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # spreadsheetId
 CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
 
 BASE_URL = os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_me_please")
 PORT = int(os.getenv("PORT", "10000"))
+
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # numeric telegram id as string
 
 if not all([BOT_TOKEN, GOOGLE_SHEET_ID, CREDENTIALS_JSON]):
     raise ValueError("Не заданы переменные окружения: BOT_TOKEN / GOOGLE_SHEET_ID / GOOGLE_SHEETS_CREDENTIALS")
@@ -38,6 +41,10 @@ BASE_URL = BASE_URL.rstrip("/")
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
+if not ADMIN_USER_ID:
+    # Не падаем, но админка не будет работать корректно.
+    print("[WARN] ADMIN_USER_ID не задан. /admin будет недоступен.")
+
 
 # =========================
 # TIMEZONE / REMINDER
@@ -48,16 +55,24 @@ REMINDER_TIME_LOCAL = time(10, 0)  # 10:00 по Берлину
 
 
 # =========================
-# GOOGLE SHEETS
+# GOOGLE AUTH / SERVICES
 # =========================
-def get_sheet():
+def get_creds():
     creds_dict = json.loads(CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(
+    return Credentials.from_service_account_info(
         creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
-    client = gspread.authorize(creds)
+
+def get_sheet_gspread():
+    client = gspread.authorize(get_creds())
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+def get_sheets_service():
+    return build("sheets", "v4", credentials=get_creds(), cache_discovery=False)
 
 
 # =========================
@@ -100,17 +115,92 @@ COL_ATTENDANCE_CONFIRMED = 8
 STATUS_BOOKED = "Записан"
 STATUS_PENDING = "Ждёт подтверждения"
 
-# Слот считается занятым при этих статусах:
 OCCUPYING_STATUSES = {STATUS_BOOKED, STATUS_PENDING}
 
 
-def ensure_sheet_headers_ru():
+def ensure_sheet_headers_ru_and_format():
     """
-    Делает заголовки красивыми и русскими.
-    ВНИМАНИЕ: перезапишет 1-ю строку (заголовки) значениями HEADERS_RU.
+    1) Делает заголовки русскими (перезаписывает строку 1).
+    2) Красиво форматирует лист: жирный заголовок, заливка, закрепление строки,
+       авто-ширина колонок, фильтр по заголовкам.
     """
-    sheet = get_sheet()
-    sheet.update("A1", [HEADERS_RU])
+    sheet = get_sheet_gspread()
+    sheet.update("A1:H1", [HEADERS_RU])
+
+    svc = get_sheets_service()
+    spreadsheet = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+    sheets = spreadsheet.get("sheets", [])
+    if not sheets:
+        return
+
+    sheet_id = sheets[0]["properties"]["sheetId"]
+
+    requests = []
+
+    # Freeze header row
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": sheet_id,
+                "gridProperties": {"frozenRowCount": 1}
+            },
+            "fields": "gridProperties.frozenRowCount"
+        }
+    })
+
+    # Header styling A1:H1
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": 1,
+                "startColumnIndex": 0,
+                "endColumnIndex": 8
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "textFormat": {"bold": True},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment": "MIDDLE",
+                    "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}
+                }
+            },
+            "fields": "userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment,backgroundColor)"
+        }
+    })
+
+    # Filter over columns A..H
+    requests.append({
+        "setBasicFilter": {
+            "filter": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1_000_000,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 8
+                }
+            }
+        }
+    })
+
+    # Auto resize columns A..H
+    requests.append({
+        "autoResizeDimensions": {
+            "dimensions": {
+                "sheetId": sheet_id,
+                "dimension": "COLUMNS",
+                "startIndex": 0,
+                "endIndex": 8
+            }
+        }
+    })
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={"requests": requests}
+    ).execute()
 
 
 # =========================
@@ -177,6 +267,29 @@ def reminder_keyboard(row_index: int) -> InlineKeyboardMarkup:
     )
 
 
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📣 Разослать напоминания сейчас", callback_data="admin_send_reminders")],
+        ]
+    )
+
+
+def admin_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, разослать", callback_data="admin_send_reminders_confirm")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_send_reminders_cancel")],
+        ]
+    )
+
+
+def is_admin(user_id: int) -> bool:
+    if not ADMIN_USER_ID:
+        return False
+    return str(user_id) == str(ADMIN_USER_ID).strip()
+
+
 def reset_slots():
     for d in SLOTS:
         for t in SLOTS[d]:
@@ -187,8 +300,8 @@ def load_bookings_from_sheet():
     """Пересобирает занятость слотов по русским статусам из таблицы."""
     try:
         reset_slots()
-        sheet = get_sheet()
-        records = sheet.get_all_records()  # ключи = заголовки в 1-й строке
+        sheet = get_sheet_gspread()
+        records = sheet.get_all_records()
         for row in records:
             status = str(row.get(H_STATUS, "")).strip()
             if status in OCCUPYING_STATUSES:
@@ -201,11 +314,8 @@ def load_bookings_from_sheet():
 
 
 def find_user_active_booking(user_id: str):
-    """
-    Возвращает (row_index, row_dict) для активной записи пользователя (по ID),
-    либо (None, None).
-    """
-    sheet = get_sheet()
+    """Ищет активную запись по ID пользователя (строго 1 аккаунт = 1 слот)."""
+    sheet = get_sheet_gspread()
     records = sheet.get_all_records()
     for i, row in enumerate(records, start=2):
         uid = str(row.get(H_USER_ID, "")).strip()
@@ -216,8 +326,7 @@ def find_user_active_booking(user_id: str):
 
 
 def slot_is_occupied_in_sheet(date_str: str, time_str: str) -> bool:
-    """Проверка слота по таблице: есть ли активная запись на дату+время."""
-    sheet = get_sheet()
+    sheet = get_sheet_gspread()
     records = sheet.get_all_records()
     for row in records:
         status = str(row.get(H_STATUS, "")).strip()
@@ -227,7 +336,131 @@ def slot_is_occupied_in_sheet(date_str: str, time_str: str) -> bool:
 
 
 # =========================
-# MAIN UX
+# ADMIN / UTIL
+# =========================
+@dp.message(Command("myid"))
+async def myid(message: types.Message):
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("Эта команда доступна только администратору.")
+        return
+
+    await message.answer(
+        "🛠 Админ-панель\n\n"
+        "Отсюда можно вручную разослать напоминания всем записанным.",
+        reply_markup=admin_keyboard()
+    )
+
+
+@dp.callback_query(lambda c: c.data == "admin_send_reminders")
+async def admin_send_reminders(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "⚠️ Вы уверены, что хотите разослать напоминания всем записанным?\n\n"
+        "Будут отправлены сообщения с кнопками подтверждения/отмены.",
+        reply_markup=admin_confirm_keyboard()
+    )
+
+
+@dp.callback_query(lambda c: c.data == "admin_send_reminders_cancel")
+async def admin_send_reminders_cancel(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "Ок, отменено. Если нужно — нажмите /admin ещё раз."
+    )
+
+
+async def send_reminders_now(force: bool) -> tuple[int, int]:
+    """
+    Рассылает напоминания всем, у кого активная запись на наши слоты.
+    Возвращает (sent_ok, sent_fail).
+
+    force=True: игнорирует 'Напоминание отправлено' (перешлёт даже если уже отправляли).
+    force=False: отправляет только тем, кому ещё не отправляли.
+    """
+    sent_ok = 0
+    sent_fail = 0
+
+    sheet = get_sheet_gspread()
+    records = sheet.get_all_records()
+
+    now = datetime.now(TZ)
+
+    for idx, row in enumerate(records, start=2):
+        status = str(row.get(H_STATUS, "")).strip()
+        if status not in OCCUPYING_STATUSES:
+            continue
+
+        d = str(row.get(H_DATE, "")).strip()
+        t = str(row.get(H_TIME, "")).strip()
+        user_id = str(row.get(H_USER_ID, "")).strip()
+
+        # только наши даты/слоты
+        if d not in SLOTS or t not in SLOTS[d]:
+            continue
+
+        reminder_sent = str(row.get(H_REMINDER_SENT, "")).strip()
+        if reminder_sent and not force:
+            continue
+
+        # Переводим в "ждёт подтверждения", слот всё равно занят
+        try:
+            sheet.update_cell(idx, COL_STATUS, STATUS_PENDING)
+        except Exception:
+            pass
+
+        text = (
+            "🔔 Напоминание о записи!\n\n"
+            f"📅 Дата: {d}\n"
+            f"🕗 Время: {t}\n\n"
+            "Пожалуйста, подтвердите, что вы придёте:\n"
+            "✅ Подтверждаю — всё ок\n"
+            "❌ Отменить — освободим слот для других"
+        )
+
+        try:
+            await bot.send_message(chat_id=int(user_id), text=text, reply_markup=reminder_keyboard(idx))
+            # пишем дату/время отправки (обновим всегда при force)
+            sheet.update_cell(idx, COL_REMINDER_SENT, now.strftime("%Y-%m-%d %H:%M:%S"))
+            sent_ok += 1
+        except Exception as e:
+            print(f"[reminder send] to {user_id} row {idx} failed: {e}")
+            sent_fail += 1
+
+    return sent_ok, sent_fail
+
+
+@dp.callback_query(lambda c: c.data == "admin_send_reminders_confirm")
+async def admin_send_reminders_confirm(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ Рассылаю напоминания…")
+
+    try:
+        ok, fail = await send_reminders_now(force=True)
+        await callback.message.edit_text(
+            f"✅ Готово!\n\nОтправлено: {ok}\nНе доставлено: {fail}\n\n"
+            "Если нужно — можно нажать /admin и разослать ещё раз."
+        )
+    except Exception as e:
+        print(f"[admin_send_reminders_confirm] error: {e}")
+        await callback.message.edit_text("❌ Ошибка при рассылке. Посмотрите логи Render.")
+
+
+# =========================
+# USER FLOW
 # =========================
 @dp.message(Command("start"))
 async def send_welcome(message: types.Message, state: FSMContext):
@@ -235,26 +468,23 @@ async def send_welcome(message: types.Message, state: FSMContext):
     load_bookings_from_sheet()
 
     user_id = str(message.from_user.id)
+    row_index, row = None, None
     try:
         row_index, row = find_user_active_booking(user_id)
     except Exception as e:
         print(f"[send_welcome] error: {e}")
-        row_index, row = None, None
 
     if row_index and row:
         date_str = str(row.get(H_DATE, ""))
         time_str = str(row.get(H_TIME, ""))
         status = str(row.get(H_STATUS, ""))
-        extra = ""
-        if status == STATUS_PENDING:
-            extra = "\n\n⚠️ Мы ждём подтверждение по напоминанию."
+        extra = "\n\n⚠️ Мы ждём подтверждение по напоминанию." if status == STATUS_PENDING else ""
 
         await message.answer(
             "✅ У вас уже есть активная запись.\n\n"
             f"📅 Дата: {date_str}\n"
             f"🕗 Время: {time_str}\n"
-            f"📌 Статус: {status}"
-            f"{extra}\n\n"
+            f"📌 Статус: {status}{extra}\n\n"
             "Вы можете изменить время или отменить запись:",
             reply_markup=manage_keyboard()
         )
@@ -274,7 +504,6 @@ async def choose_time(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     mode = data.get("mode")  # "change" или None
 
-    # В обычном режиме: 1 аккаунт = 1 слот
     if mode != "change":
         try:
             row_index, row = find_user_active_booking(user_id)
@@ -346,12 +575,11 @@ async def start_booking(callback: types.CallbackQuery, state: FSMContext):
                 await callback.answer("Этот слот только что заняли. Выберите другой.", show_alert=True)
                 return
 
-            sheet = get_sheet()
+            sheet = get_sheet_gspread()
             sheet.update_cell(sheet_row, COL_DATE, date_str)
             sheet.update_cell(sheet_row, COL_TIME, time_str)
             sheet.update_cell(sheet_row, COL_STATUS, STATUS_BOOKED)
 
-            # локально
             if old_date in SLOTS and old_time in SLOTS[old_date]:
                 SLOTS[old_date][old_time] = False
             SLOTS[date_str][time_str] = True
@@ -414,7 +642,7 @@ async def get_phone(message: types.Message, state: FSMContext):
 
     user_id = str(message.from_user.id)
 
-    # Перед записью — супер-строгая проверка "1 аккаунт = 1 слот"
+    # супер-строго: 1 аккаунт = 1 слот
     try:
         row_index, row = find_user_active_booking(user_id)
         if row_index and row:
@@ -438,7 +666,6 @@ async def get_phone(message: types.Message, state: FSMContext):
     time_str = data["time"]
     name = data["name"]
 
-    # защита от гонки
     load_bookings_from_sheet()
     if SLOTS.get(date_str, {}).get(time_str) is None or SLOTS[date_str][time_str]:
         await message.answer("❌ Увы, этот слот только что заняли. Выберите другое время: /start")
@@ -452,8 +679,7 @@ async def get_phone(message: types.Message, state: FSMContext):
         return
 
     try:
-        sheet = get_sheet()
-        # reminder/confirmation пока пустые
+        sheet = get_sheet_gspread()
         sheet.append_row([user_id, name, phone, date_str, time_str, STATUS_BOOKED, "", ""])
         SLOTS[date_str][time_str] = True
     except Exception as e:
@@ -474,13 +700,13 @@ async def get_phone(message: types.Message, state: FSMContext):
 
 
 # =========================
-# MANAGE BUTTONS (CHANGE/CANCEL)
+# MANAGE BUTTONS
 # =========================
 @dp.callback_query(lambda c: c.data == "cancel_booking")
 async def cancel_booking(callback: types.CallbackQuery, state: FSMContext):
     user_id = str(callback.from_user.id)
     try:
-        sheet = get_sheet()
+        sheet = get_sheet_gspread()
         row_index, row = find_user_active_booking(user_id)
         if not row_index:
             await callback.answer("У вас нет активной записи.", show_alert=True)
@@ -533,7 +759,7 @@ async def change_booking(callback: types.CallbackQuery, state: FSMContext):
 async def reminder_yes(callback: types.CallbackQuery):
     try:
         row_index = int(callback.data.split("_")[-1])
-        sheet = get_sheet()
+        sheet = get_sheet_gspread()
 
         user_id = str(callback.from_user.id)
         row_vals = sheet.row_values(row_index)
@@ -559,7 +785,7 @@ async def reminder_yes(callback: types.CallbackQuery):
 async def reminder_cancel(callback: types.CallbackQuery):
     try:
         row_index = int(callback.data.split("_")[-1])
-        sheet = get_sheet()
+        sheet = get_sheet_gspread()
 
         user_id = str(callback.from_user.id)
         row_vals = sheet.row_values(row_index)
@@ -587,13 +813,12 @@ async def reminder_cancel(callback: types.CallbackQuery):
 
 
 # =========================
-# REMINDER SCHEDULER
+# AUTO REMINDER LOOP (best-effort on free)
 # =========================
 async def send_reminders_if_needed():
     """
-    10 февраля (по Берлину) отправляет напоминание всем,
-    у кого активная запись. Чтобы не спамить — пишет время отправки в столбец
-    "Напоминание отправлено". Статус переводит в "Ждёт подтверждения".
+    10 февраля (по Берлину) — best-effort. На бесплатном Render может не сработать,
+    если сервис спит. Для надёжности используйте /admin.
     """
     try:
         now = datetime.now(TZ)
@@ -602,47 +827,10 @@ async def send_reminders_if_needed():
         if now.time() < REMINDER_TIME_LOCAL:
             return
 
-        sheet = get_sheet()
-        records = sheet.get_all_records()
-
-        for idx, row in enumerate(records, start=2):
-            status = str(row.get(H_STATUS, "")).strip()
-            if status not in OCCUPYING_STATUSES:
-                continue
-
-            d = str(row.get(H_DATE, "")).strip()
-            t = str(row.get(H_TIME, "")).strip()
-            user_id = str(row.get(H_USER_ID, "")).strip()
-
-            # только наши даты/слоты
-            if d not in SLOTS or t not in SLOTS[d]:
-                continue
-
-            reminder_sent = str(row.get(H_REMINDER_SENT, "")).strip()
-            if reminder_sent:
-                continue  # уже отправляли
-
-            # Переводим в "ждёт подтверждения", но слот остаётся занятым
-            try:
-                sheet.update_cell(idx, COL_STATUS, STATUS_PENDING)
-            except Exception:
-                pass
-
-            text = (
-                "🔔 Напоминание о записи!\n\n"
-                f"📅 Дата: {d}\n"
-                f"🕗 Время: {t}\n\n"
-                "Пожалуйста, подтвердите, что вы придёте:\n"
-                "✅ Подтверждаю — всё ок\n"
-                "❌ Отменить — освободим слот для других"
-            )
-
-            try:
-                await bot.send_message(chat_id=int(user_id), text=text, reply_markup=reminder_keyboard(idx))
-                sheet.update_cell(idx, COL_REMINDER_SENT, now.strftime("%Y-%m-%d %H:%M:%S"))
-            except Exception as e:
-                # пользователь мог не начинать чат / блокировать бота
-                print(f"[reminder send] to {user_id} row {idx} failed: {e}")
+        # только тем, кому ещё не отправляли
+        ok, fail = await send_reminders_now(force=False)
+        if ok or fail:
+            print(f"[auto reminders] ok={ok} fail={fail}")
 
     except Exception as e:
         print(f"[send_reminders_if_needed] error: {e}")
@@ -651,14 +839,18 @@ async def send_reminders_if_needed():
 async def reminder_loop():
     while True:
         await send_reminders_if_needed()
-        await asyncio.sleep(600)  # раз в 10 минут
+        await asyncio.sleep(600)
 
 
 # =========================
 # WEBHOOK LIFECYCLE
 # =========================
 async def on_startup(app: web.Application):
-    ensure_sheet_headers_ru()
+    try:
+        ensure_sheet_headers_ru_and_format()
+    except Exception as e:
+        print(f"[format sheet] error: {e}")
+
     load_bookings_from_sheet()
 
     await bot.set_webhook(WEBHOOK_URL)
