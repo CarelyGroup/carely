@@ -1,4 +1,5 @@
-aiogram==3.13.0
-gspread>=6.1.2
-google-auth>=2.28.0
-google-auth-oauthlib>=0.4.6
+aiogram==3.*
+aiohttp
+gspread
+google-auth
+google-api-python-client
