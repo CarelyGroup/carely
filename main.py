@@ -125,7 +125,7 @@ def ensure_sheet_headers_ru_and_format():
        авто-ширина колонок, фильтр по заголовкам.
     """
     sheet = get_sheet_gspread()
-    sheet.update("A1:H1", [HEADERS_RU])
+    sheet.update(values=[HEADERS_RU], range_name="A1:H1")
 
     svc = get_sheets_service()
     spreadsheet = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
