@@ -3,6 +3,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime, timedelta
+import asyncio
 
 # Получаем токен из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -44,64 +45,4 @@ async def choose_time(callback: types.CallbackQuery):
     date_str = callback.data.split("_")[1]
     
     if date_str not in bookings:
-        await callback.answer("Неверная дата", show_alert=True)
-        return
-
-    free_slots = [
-        time for time, user in bookings[date_str].items() if user is None
-    ]
-    
-    if not free_slots:
-        await callback.message.edit_text("❌ На этот день все слоты заняты!")
-        return
-
-    buttons = [
-        [InlineKeyboardButton(f"{date_str} {t}", callback_data=f"slot_{date_str}_{t}")]
-        for t in free_slots[:20]
-    ]
-    back_button = [InlineKeyboardButton("⬅️ Назад к выбору дня", callback_data="back")]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons + [back_button])
-    
-    await callback.message.edit_text(f"Выберите время на {date_str}:", reply_markup=keyboard)
-
-@dp.callback_query(lambda c: c.data == "back")
-async def go_back(callback: types.CallbackQuery):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton("Четверг, 12 февраля", callback_data="day_2026-02-12")],
-            [InlineKeyboardButton("Пятница, 13 февраля", callback_data="day_2026-02-13")]
-        ]
-    )
-    await callback.message.edit_text(EVENT_INFO, reply_markup=keyboard)
-
-@dp.callback_query(lambda c: c.data.startswith("slot_"))
-async def book_slot(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    if len(parts) != 3:
-        await callback.answer("Ошибка", show_alert=True)
-        return
-        
-    date_str, time_str = parts[1], parts[2]
-    
-    if date_str not in bookings or time_str not in bookings[date_str]:
-        await callback.answer("Слот не найден", show_alert=True)
-        return
-
-    if bookings[date_str][time_str] is not None:
-        await callback.answer("Этот слот уже занят!", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-    name = callback.from_user.full_name
-    bookings[date_str][time_str] = user_id
-
-    await callback.message.edit_text(
-        f"✅ Вы успешно записаны!\n\n📅 Дата: {date_str}\n🕗 Время: {time_str}\n👤 {name}"
-    )
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+       
